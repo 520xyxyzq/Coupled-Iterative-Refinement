@@ -18,8 +18,10 @@ stdout*
 local_data
 model_weights
 temporary_cache
+qualitative_output
 sample_*/
 dist/
 *.so
+*.zip
 build/
 *.temp
