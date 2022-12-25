@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from pathlib import Path
 from test import generate_pose_from_detections
 from tqdm import tqdm
@@ -12,11 +13,17 @@ import torch
 from lietorch import SE3
 
 from crops import crop_inputs
-from detector import load_detector
+from detector import PandasTensorCollection, concatenate, load_detector
 from pose_models import load_efficientnet
 from train import format_gin_override, load_raft_model
 from utils import Pytorch3DRenderer, get_perturbations
 from datasets import lin_interp
+
+sys.path.append(
+    Path(".").resolve()
+    + "/additional_scripts/bop_toolkit_challenge/"
+)
+from bop_toolkit_lib import inout
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = True
@@ -27,6 +34,24 @@ def read_depth(depth_path: Path, depth_scale: float, interpolate=False):
     if interpolate: # interpolating the missing depth values takes about 0.7s, scipy is slow
         return lin_interp(depth)
     return depth
+
+def tc_to_csv(predictions, csv_path):
+    preds = []
+    for n in range(len(predictions)):
+        TCO_n = predictions.poses[n]
+        t = TCO_n[:3, -1] * 1e3  # m -> mm conversion
+        R = TCO_n[:3, :3]
+        row = predictions.infos.iloc[n]
+        obj_id = int(row.label.split('_')[-1])
+        score = row.score
+        time = -1.0
+        pred = dict(scene_id=row.scene_id,
+                    im_id=row.view_id,
+                    obj_id=obj_id,
+                    score=score,
+                    t=t, R=R, time=time)
+        preds.append(pred)
+    inout.save_bop_results(csv_path, preds)
 
 @torch.no_grad()
 def main():
@@ -67,8 +92,9 @@ def main():
 
     scene_cameras = json.loads((args.scene_dir / "scene_camera.json").read_text())
     image_loop = list(scene_cameras.items())
-    np.random.default_rng(0).shuffle(image_loop)
+    # np.random.default_rng(0).shuffle(image_loop)
 
+    all_preds = []
     for image_index, (frame_id, scene_camera) in enumerate(image_loop):
         camera_intrinsics = torch.as_tensor(scene_camera['cam_K'], device='cuda', dtype=torch.float32).view(1,3,3)
         depth_scale = scene_camera['depth_scale']
@@ -84,30 +110,35 @@ def main():
             interpolated_depth = torch.as_tensor(interpolated_depth, device='cuda', dtype=torch.float32).unsqueeze(0)
 
         # Generate candidate detections using a Mask-RCNN
-        detections = detector.get_detections(images=images)
+        detections = detector.get_detections(images=images, detection_th=0.3)
+        if len(detections) == 0:
+            continue
 
         # Convert the predicted bounding boxes to initial translation estimates
         data_TCO_init = generate_pose_from_detections(detections=detections, K=camera_intrinsics)
+        data_TCO_init.infos.loc[:,"scene_id"] = 0
+        data_TCO_init.infos.loc[:,"view_id"] = frame_id
+        data_TCO_init.infos.loc[:,"time"] = -1.0
 
         for obj_idx, (_, obj_label, _) in tqdm(list(detections.infos.iterrows()), desc=f"Predicting poses for {len(detections)} detected objects in image {image_index+1}/{len(image_loop)}"):
             mrcnn_mask = detections.masks[[obj_idx]]
             mrcnn_pose = data_TCO_init.poses[[obj_idx]]
-            basename = f"{image_index}.{obj_idx+1}"
+            # basename = f"{image_index}.{obj_idx+1}"
 
             # Crop the image given the translation predicted by the Mask-RCNN
             images_cropped, K_cropped, _, _, masks_cropped, depths_cropped = crop_inputs(images=images, K=camera_intrinsics, TCO=mrcnn_pose, \
                 labels=[obj_label], masks=mrcnn_mask, sce_depth=interpolated_depth, render_size=render_resolution.squeeze().cpu().numpy())
 
             mrcnn_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], mrcnn_pose, K_cropped, render_resolution)
-            imageio.imwrite(args.output_dir / f"{basename}_1_Mask_RCNN_Initial_Translation.png", mrcnn_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
+            # imageio.imwrite(args.output_dir / f"{basename}_1_Mask_RCNN_Initial_Translation.png", mrcnn_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
 
             # Generate a coarse pose estimate using an efficientnet
             assert (mrcnn_rendered_rgb.shape == images_cropped.shape)
             images_input = torch.cat((images_cropped, mrcnn_rendered_rgb), dim=1)
             current_pose_est = run_efficientnet(images_input, mrcnn_pose, K_cropped)
 
-            efficientnet_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], current_pose_est, K_cropped, render_resolution)
-            imageio.imwrite(args.output_dir / f"{basename}_2_Efficientnet_Prediction.png", efficientnet_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
+            # efficientnet_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], current_pose_est, K_cropped, render_resolution)
+            # imageio.imwrite(args.output_dir / f"{basename}_2_Efficientnet_Prediction.png", efficientnet_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
 
             for outer_loop_idx in range(args.num_outer_loops):
                 # Crop image given the previous pose estimate
@@ -135,11 +166,15 @@ def main():
                         num_solver_steps=args.num_solver_steps, num_inner_loops=args.num_inner_loops)
                 current_pose_est = SE3(outputs['Gs'][-1].contiguous()[:, -1]).matrix()
 
-                efficientnet_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], current_pose_est, K_cropped, render_resolution)
-                imageio.imwrite(args.output_dir / f"{basename}_3_CIR_Outer-Loop-{outer_loop_idx}.png", efficientnet_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
+                # efficientnet_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], current_pose_est, K_cropped, render_resolution)
+                # imageio.imwrite(args.output_dir / f"{basename}_3_CIR_Outer-Loop-{outer_loop_idx}.png", efficientnet_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
 
-            imageio.imwrite(args.output_dir / f"{basename}_4_Image_Crop.png", images_cropped[0].permute(1,2,0).mul(255).byte().cpu())
+            batch_preds = PandasTensorCollection(data_TCO_init.infos[obj_idx:obj_idx+1], poses=current_pose_est.cpu())
+            all_preds.append(batch_preds)
+            # imageio.imwrite(args.output_dir / f"{basename}_4_Image_Crop.png", images_cropped[0].permute(1,2,0).mul(255).byte().cpu())
 
+    all_preds = concatenate(all_preds)
+    tc_to_csv(all_preds, args.scene_dir/f"candidates.csv")
 
 if __name__ == '__main__':
     main()
