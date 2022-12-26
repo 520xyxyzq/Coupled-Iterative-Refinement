@@ -29,3 +29,5 @@ dependencies:
     - opencv-python
     - wget
     - pypng
+    - glumpy
+    - PyOpenGL

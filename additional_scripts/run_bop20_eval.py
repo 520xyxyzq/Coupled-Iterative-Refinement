@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import torch
+sys.path.append(str(Path('.').resolve()))
 from detector import concatenate
 from tqdm import tqdm
 
