@@ -21,6 +21,7 @@ temporary_cache
 qualitative_output
 my_evaluation
 test_evaluation
+runs
 sample_*/
 dist/
 *.so

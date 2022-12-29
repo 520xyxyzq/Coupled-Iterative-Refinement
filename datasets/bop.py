@@ -125,7 +125,7 @@ class BOPDataset:
             dict_symmetries = {k: obj_infos.get(k, []) for k in ('symmetries_discrete', 'symmetries_continuous')}
             self.obj_ds.objects[obj_key]['symmetries'] = make_bop_symmetries(dict_symmetries, scale=obj_infos['scale'])
 
-        self.background_augmentations = VOCBackgroundAugmentation(voc_root='local_data/VOCdevkit/VOC2012', p=0.3)
+        self.background_augmentations = VOCBackgroundAugmentation(voc_root='local_data/VOCdevkit', p=0.3)
         self.rgb_augmentations = [
             PillowBlur(p=0.4, factor_interval=(1, 3)),
             PillowSharpness(p=0.3, factor_interval=(0., 50.)),
