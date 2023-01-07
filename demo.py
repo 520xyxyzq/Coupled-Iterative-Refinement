@@ -18,9 +18,10 @@ from pose_models import load_efficientnet
 from train import format_gin_override, load_raft_model
 from utils import Pytorch3DRenderer, get_perturbations
 from datasets import lin_interp
+from utils.visual_utils import drawDetections
 
 sys.path.append(
-    Path(".").resolve()
+    str(Path(".").resolve())
     + "/additional_scripts/bop_toolkit_challenge/"
 )
 from bop_toolkit_lib import inout
@@ -95,11 +96,14 @@ def main():
     # np.random.default_rng(0).shuffle(image_loop)
 
     all_preds = []
+    all_img_dets = []
+    all_img_preds = []
     for image_index, (frame_id, scene_camera) in enumerate(image_loop):
         camera_intrinsics = torch.as_tensor(scene_camera['cam_K'], device='cuda', dtype=torch.float32).view(1,3,3)
         depth_scale = scene_camera['depth_scale']
+        # TODO: read all png in folder
         rgb_path = args.scene_dir / "rgb" / f"{int(frame_id):06d}.png"
-        images = imageio.imread(rgb_path)
+        images = imageio.v2.imread(rgb_path)
         render_resolution = torch.tensor(images.shape[:2], device='cuda', dtype=torch.float32).view(1,2) / 2
         images = torch.as_tensor(images, device='cuda', dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255
         if args.rgb_only:
@@ -111,7 +115,13 @@ def main():
 
         # Generate candidate detections using a Mask-RCNN
         detections = detector.get_detections(images=images, detection_th=0.3)
+        img_dets = drawDetections(images.clone(), detections)
+        all_img_dets.append(img_dets)
         if len(detections) == 0:
+            img_no_pred = images.clone().mul(255).byte()
+            img_no_pred = img_no_pred.squeeze(0).permute(1, 2, 0)
+            img_no_pred = img_no_pred.detach().cpu()
+            all_img_preds.append(img_no_pred)
             continue
 
         # Convert the predicted bounding boxes to initial translation estimates
@@ -120,14 +130,19 @@ def main():
         data_TCO_init.infos.loc[:,"view_id"] = frame_id
         data_TCO_init.infos.loc[:,"time"] = -1.0
 
+        img_preds = []
         for obj_idx, (_, obj_label, _) in tqdm(list(detections.infos.iterrows()), desc=f"Predicting poses for {len(detections)} detected objects in image {image_index+1}/{len(image_loop)}"):
             mrcnn_mask = detections.masks[[obj_idx]]
             mrcnn_pose = data_TCO_init.poses[[obj_idx]]
             # basename = f"{image_index}.{obj_idx+1}"
 
             # Crop the image given the translation predicted by the Mask-RCNN
-            images_cropped, K_cropped, _, _, masks_cropped, depths_cropped = crop_inputs(images=images, K=camera_intrinsics, TCO=mrcnn_pose, \
-                labels=[obj_label], masks=mrcnn_mask, sce_depth=interpolated_depth, render_size=render_resolution.squeeze().cpu().numpy())
+            images_cropped, K_cropped, _, _, masks_cropped, depths_cropped = crop_inputs(
+                images=images.clone(), K=camera_intrinsics, TCO=mrcnn_pose,
+                labels=[obj_label], masks=mrcnn_mask, 
+                sce_depth=interpolated_depth, 
+                render_size=render_resolution.squeeze().cpu().numpy()
+            )
 
             mrcnn_rendered_rgb, _, _ = Pytorch3DRenderer()([obj_label], mrcnn_pose, K_cropped, render_resolution)
             # imageio.imwrite(args.output_dir / f"{basename}_1_Mask_RCNN_Initial_Translation.png", mrcnn_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
@@ -142,8 +157,12 @@ def main():
 
             for outer_loop_idx in range(args.num_outer_loops):
                 # Crop image given the previous pose estimate
-                images_cropped, K_cropped, _, _, masks_cropped, depths_cropped = crop_inputs(images=images, K=camera_intrinsics, TCO=current_pose_est, \
-                labels=[obj_label], masks=mrcnn_mask, sce_depth=interpolated_depth, render_size=render_resolution.squeeze().cpu().numpy())
+                images_cropped, K_cropped, _, _, masks_cropped, depths_cropped = crop_inputs(
+                    images=images.clone(), K=camera_intrinsics, TCO=current_pose_est,
+                    labels=[obj_label], masks=mrcnn_mask,
+                    sce_depth=interpolated_depth,
+                    render_size=render_resolution.squeeze().cpu().numpy()
+                )
 
                 # Render additional viewpoints
                 input_pose_multiview = get_perturbations(current_pose_est).flatten(0,1)
@@ -170,9 +189,26 @@ def main():
                 # imageio.imwrite(args.output_dir / f"{basename}_3_CIR_Outer-Loop-{outer_loop_idx}.png", efficientnet_rendered_rgb[0].permute(1,2,0).mul(255).byte().cpu())
 
             batch_preds = PandasTensorCollection(data_TCO_init.infos[obj_idx:obj_idx+1], poses=current_pose_est.cpu())
+            img_preds.append(batch_preds)
             all_preds.append(batch_preds)
             # imageio.imwrite(args.output_dir / f"{basename}_4_Image_Crop.png", images_cropped[0].permute(1,2,0).mul(255).byte().cpu())
 
+        # All object predictions in the image
+        img_preds = concatenate(img_preds)
+        img_preds = drawDetections(
+            images, img_preds, camera_intrinsics, render_cad=True
+        )
+        all_img_preds.append(img_preds)
+
+    # Uncomment to save the detection video
+    imageio.mimwrite(
+        f"{args.scene_dir}/detections.mp4", all_img_dets, fps=2, quality=8
+    )
+    print(f"2D detection video saved as {args.scene_dir}/detections.mp4")
+    imageio.mimwrite(
+        f"{args.scene_dir}/predictions.mp4", all_img_preds, fps=2, quality=8
+    )
+    print(f"6D pose pred video saved as {args.scene_dir}/predictions.mp4")   
     all_preds = concatenate(all_preds)
     tc_to_csv(all_preds, args.scene_dir/f"candidates.csv")
 
