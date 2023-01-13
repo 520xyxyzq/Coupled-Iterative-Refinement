@@ -19,6 +19,7 @@ from train import format_gin_override, load_raft_model
 from utils import Pytorch3DRenderer, get_perturbations
 from datasets import lin_interp
 from utils.visual_utils import drawDetections
+from utils.io_utils import readDetections, returnEmptyDetection
 
 sys.path.append(
     str(Path(".").resolve())
@@ -67,6 +68,10 @@ def main():
     parser.add_argument('--num_solver_steps', type=int, default=3, help="number of BD-PnP solver steps per inner-loop (doesn't affect Modified BD-PnP)")
     parser.add_argument('--obj_models', required=True, choices=['ycbv', 'tless', 'lmo', 'hb', 'tudl', 'icbin', 'itodd'], help="which object models to use")
     parser.add_argument('--rgb_only', action='store_true', help="use the RGB-only model")
+    parser.add_argument(
+        "--read_det", action="store_true", 
+        help="Read detections from another model"
+    )
     args = parser.parse_args()
     args.override = format_gin_override(args.override)
     gin.parse_config_files_and_bindings(["configs/base.gin", f"configs/test_{args.obj_models}_{'rgb' if args.rgb_only else 'rgbd'}.gin"], args.override)
@@ -94,6 +99,9 @@ def main():
     scene_cameras = json.loads((args.scene_dir / "scene_camera.json").read_text())
     image_loop = list(scene_cameras.items())
     # np.random.default_rng(0).shuffle(image_loop)
+    # Read object detections from file instead of using MaskRCNN
+    if args.read_det:
+        dets_dict = readDetections(f"{args.scene_dir / 'detections.json'}")
 
     all_preds = []
     all_img_dets = []
@@ -114,7 +122,11 @@ def main():
             interpolated_depth = torch.as_tensor(interpolated_depth, device='cuda', dtype=torch.float32).unsqueeze(0)
 
         # Generate candidate detections using a Mask-RCNN
-        detections = detector.get_detections(images=images, detection_th=0.3)
+        if not args.read_det:
+            detections = detector.get_detections(images=images, detection_th=0.3)
+        else:
+            dets_empty = returnEmptyDetection(images.shape[0], images.shape[1])
+            detections = dets_dict.get(int(frame_id), dets_empty)
         img_dets = drawDetections(images.clone(), detections)
         all_img_dets.append(img_dets)
         if len(detections) == 0:
