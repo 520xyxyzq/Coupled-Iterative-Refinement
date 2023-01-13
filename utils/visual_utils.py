@@ -25,7 +25,6 @@ def drawDetections(
     @param fontsize (int): The bbox label font size (points)
     @param alpha (float): Transparency of the mask
     @param render_cad (bool): Render object as CAD if True else ren pure color
-    @param alpha_cad (float): Transparency of the rendered object models
     """
     labels = detections.infos["label"]
     scores = detections.infos["score"]
