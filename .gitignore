@@ -19,6 +19,7 @@ local_data
 model_weights
 temporary_cache
 qualitative_output
+checkpoints
 my_evaluation
 test_evaluation
 runs
